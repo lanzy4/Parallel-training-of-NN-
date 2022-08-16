@@ -1,0 +1,20 @@
+CONV img_size_x= 32 img_size_y= 32 in_channels= 3 out_channels= 64 kernel_size= 3 stride= 1 padding= 1
+CONV img_size_x= 32 img_size_y= 32 in_channels= 64 out_channels= 64 kernel_size= 3 stride= 1 padding= 1
+MAXPOOL
+CONV img_size_x= 16 img_size_y= 16 in_channels= 64 out_channels= 128 kernel_size= 3 stride= 1 padding= 1
+CONV img_size_x= 16 img_size_y= 16 in_channels= 128 out_channels= 128 kernel_size= 3 stride= 1 padding= 1
+MAXPOOL
+CONV img_size_x= 8 img_size_y= 8 in_channels= 128 out_channels= 256 kernel_size= 3 stride= 1 padding= 1
+CONV img_size_x= 8 img_size_y= 8 in_channels= 256 out_channels= 256 kernel_size= 3 stride= 1 padding= 1
+MAXPOOL
+CONV img_size_x= 4 img_size_y= 4 in_channels= 256 out_channels= 512 kernel_size= 3 stride= 1 padding= 1
+CONV img_size_x= 4 img_size_y= 4 in_channels= 512 out_channels= 512 kernel_size= 3 stride= 1 padding= 1
+MAXPOOL
+CONV img_size_x= 2 img_size_y= 2 in_channels= 512 out_channels= 512 kernel_size= 3 stride= 1 padding= 1
+CONV img_size_x= 2 img_size_y= 2 in_channels= 512 out_channels= 512 kernel_size= 3 stride= 1 padding= 1
+MAXPOOL
+
+FC in_features= 512 out_features= 4096
+FC in_features= 4096 out_features= 10
+
+END

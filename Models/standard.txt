@@ -1,0 +1,9 @@
+CONV img_size_x= 28 img_size_y= 28 in_channels= 1 out_channels= 32 kernel_size= 5 stride= 1 padding= 2
+MAXPOOL
+CONV img_size_x= 14 img_size_y= 14 in_channels= 32 out_channels= 64 kernel_size= 5 stride= 1 padding= 2
+MAXPOOL
+
+FC in_features= 3136 out_features= 128
+FC in_features= 128 out_features= 10
+
+END
