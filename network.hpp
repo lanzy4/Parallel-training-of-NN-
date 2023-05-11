@@ -7,10 +7,31 @@
 #include <cstdlib>
 #include <random>
 #include <stdexcept>
+
+#include <cstring>
+#include <map>
+#include <vector>
+#include <unistd.h>
+#include <cerrno>
+#include <netdb.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
 #include "cblas.h"
 #include <mpi.h>
 
-
+struct DatasetParameters {
+    int test_amount;
+    int train_amount;
+    int img_size;
+    int channels_n;
+    int classes_number;  
+    float max_pixel_value = 255.0;
+    float mean[3];
+    float std[3];
+};
 
 class Network{
 public:
@@ -54,14 +75,14 @@ public:
     void add_conv_layer(int img_x, int img_y, int m_in, int m_out, int ker, int s, int p, int maxpool_f = 0);
     void add_fc_layer(int n_input, int n_output);
 
-    void set_communication_options(int frq = 1, int gossip_f = 0, int spars_f = 0, double spars_thr = 0.1);
+    void set_communication_options(int frq = 1, int gossip_f = 0, int spars_f = 0, double spars_thr = 0.1, int group_f = 0);
 
     void predict( float const* const* x, int img_size_x, int img_size_y, int channels_n, float* res);
 
     ~Network();
 
-    void fit(float ***X, int *y, int img_size_x, int img_size_y, int channels_n,
-             int sample_size, int minibatch_size = 0, int iter_n = 100, float learning_rate = 0.0001);
+    void fit(std::string dataset_filename, DatasetParameters dataset_params,
+             int minibatch_size = 0, int iter_n = 100, float learning_rate = 0.0001, int epochs_done = 0);
 
 
 
@@ -97,18 +118,28 @@ public:
 
     double communication_time;
     double synchronization_time;
+    double dataload_time;
     int communication_frequency;
     int gossip_flag;
     int sparsification_flag;
     double spars_threshold;
+    int group_communication_flag;
 
     int gossip_step;
+
+    std::string hostname;
+    std::map<std::string, std::vector<int>> address_map;
+    int leader;
+    MPI_Comm group_communicator;
+    int group_size;
+
+    DatasetParameters dataset_params;
 
 
 
     void initial_weights_synch();
 
-    void grad_synch();
+    void grad_synch(int global_iteration = 0);
     void grad_zero();
 
 
@@ -133,7 +164,7 @@ public:
     void maxpool(float const* const* x, float** res, int** indices, int fmap_n, int img_size);
     void maxpool_backward(float **x, float **res, int **indices, ConvParameters &params, int size);
 
-    void shuffle(float*** X, int* y, int n);
+    void shuffle(int* y, int n);
 
     void fit_step(float*** X, int* y, int size);
 

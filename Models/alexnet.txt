@@ -1,0 +1,14 @@
+CONV img_size_x= 227 img_size_y= 227 in_channels= 3 out_channels= 96 kernel_size= 11 stride= 4 padding= 2
+MAXPOOL
+CONV img_size_x= 28 img_size_y= 28 in_channels= 96 out_channels= 256 kernel_size= 7 stride= 1 padding= 1
+MAXPOOL
+CONV img_size_x= 12 img_size_y= 12 in_channels= 256 out_channels= 384 kernel_size= 3 stride= 1 padding= 1
+CONV img_size_x= 12 img_size_y= 12 in_channels= 384 out_channels= 384 kernel_size= 3 stride= 1 padding= 1
+CONV img_size_x= 12 img_size_y= 12 in_channels= 384 out_channels= 256 kernel_size= 3 stride= 1 padding= 1
+MAXPOOL
+
+FC in_features= 9216 out_features= 4096
+FC in_features= 4096 out_features= 4096
+FC in_features= 4096 out_features= 10
+
+END

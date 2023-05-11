@@ -13,14 +13,6 @@
 #include "network.hpp"
 
 
-struct DatasetParameters {
-    int test_amount;
-    int train_amount;
-    int img_size;
-    int channels_n;
-    int classes_number;  
-};
-
 
 int reverseInt (int i);
 
@@ -41,4 +33,6 @@ void free_dataset(float*** &x_train, int* &y_train, float*** &x_test,
 
 void model_from_file(Network &model, std::string filename);
 
+
+void set_dataset_params(DatasetParameters &params, std::string dataset_name);
 

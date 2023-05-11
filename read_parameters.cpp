@@ -410,3 +410,82 @@ void model_from_file(Network &model, std::string filename) {
 }
 
 
+void set_dataset_params(DatasetParameters &params, std::string dataset_name) {
+    if(dataset_name == "IMAGENETTE") {
+        params.train_amount = 9469;
+        params.test_amount = 3925;
+        params.img_size = 224;
+        params.channels_n = 3;
+        params.classes_number = 10;
+        params.max_pixel_value = 255.0;
+
+        params.mean[0] = 0.4625;
+        params.mean[1] = 0.4580;
+        params.mean[2] = 0.4298;
+
+        params.std[0] = 0.2827;
+        params.std[1] = 0.2795;
+        params.std[2] = 0.3019;
+    } else if(dataset_name == "IMAGEWOOF") {
+        params.train_amount = 9025;
+        params.test_amount = 3929;
+        params.img_size = 224;
+        params.channels_n = 3;
+        params.classes_number = 10;
+        params.max_pixel_value = 255.0;
+
+        params.mean[0] = 0.4860;
+        params.mean[1] = 0.4559;
+        params.mean[2] = 0.3940;
+
+        params.std[0] = 0.2575;
+        params.std[1] = 0.2505;
+        params.std[2] = 0.2591;
+    } else if(dataset_name == "IMAGENETTE227") {
+        params.train_amount = 9469;
+        params.test_amount = 3925;
+        params.img_size = 227;
+        params.channels_n = 3;
+        params.classes_number = 10;
+        params.max_pixel_value = 255.0;
+
+        params.mean[0] = 0.4625;
+        params.mean[1] = 0.4580;
+        params.mean[2] = 0.4298;
+
+        params.std[0] = 0.2827;
+        params.std[1] = 0.2795;
+        params.std[2] = 0.3019;
+    } else if(dataset_name == "IMAGEWOOF227") {
+        params.train_amount = 9025;
+        params.test_amount = 3929;
+        params.img_size = 227;
+        params.channels_n = 3;
+        params.classes_number = 10;
+        params.max_pixel_value = 255.0;
+
+        params.mean[0] = 0.4860;
+        params.mean[1] = 0.4559;
+        params.mean[2] = 0.3940;
+
+        params.std[0] = 0.2575;
+        params.std[1] = 0.2505;
+        params.std[2] = 0.2591;
+    } else if(dataset_name == "CIFAR10") {
+        params.train_amount = 50000;
+        params.test_amount = 10000;
+        params.img_size = 32;
+        params.channels_n = 3;
+        params.classes_number = 10;
+        params.max_pixel_value = 255.0;
+
+        params.mean[0] = 0.49139968;
+        params.mean[1] = 0.48215827;
+        params.mean[2] = 0.44653124;
+
+        params.std[0] = 0.24703233;
+        params.std[1] = 0.24348505;
+        params.std[2] = 0.26158768;
+    }
+}
+

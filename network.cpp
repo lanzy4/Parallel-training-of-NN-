@@ -1,4 +1,5 @@
 #include "network.hpp"
+#include "read_parameters.hpp"
 
 #include <iostream>
 #include <cmath>
@@ -7,6 +8,18 @@
 #include <cstdlib>
 #include <random>
 #include <stdexcept>
+
+#include <cstring>
+#include <map>
+#include <vector>
+#include <unistd.h>
+#include <cerrno>
+#include <netdb.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
 #include "cblas.h"
 #include <mpi.h>
 
@@ -17,10 +30,12 @@ Network::Network() {
 
     communication_time = 0;
     synchronization_time = 0;
+    dataload_time = 0;
     communication_frequency = 1;
     gossip_flag = 0;
     sparsification_flag = 0;
     spars_threshold = 0.1;
+    group_communication_flag = 0;
 
     gossip_step = 1;
 
@@ -41,6 +56,43 @@ Network::Network() {
     fc_inputs = new float*[max_fc_layers];
 
     maxpool_indices = new int**[max_conv_layers];
+
+
+    int rank, np;
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+        MPI_Comm_size(MPI_COMM_WORLD, &np);
+
+        char host[256];
+        struct hostent *host_entry;
+        gethostname(host, sizeof(host));
+
+        char *address_map_string = new char[np*256];
+        MPI_Allgather(host, 256, MPI_CHAR, address_map_string, 256, MPI_CHAR, MPI_COMM_WORLD);
+
+        hostname = host;
+
+        for(int i = 0; i < np; i++) {
+            char host_i[256];
+            std::strncpy(host_i, &address_map_string[i * 256], 256);
+            std::string host_i_str = host_i;
+            address_map[host_i_str].push_back(i);
+        }
+
+        leader = address_map[hostname][0];
+        group_size = address_map[hostname].size();
+
+        delete[] address_map_string;
+
+
+
+        MPI_Group world_group;
+        MPI_Comm_group(MPI_COMM_WORLD, &world_group);
+        int *group_ranks = &address_map[hostname][0];
+        int group_size = address_map[hostname].size();
+        MPI_Group group;
+        MPI_Group_incl(world_group, group_size, group_ranks, &group);
+        group_communicator;
+        MPI_Comm_create(MPI_COMM_WORLD, group, &group_communicator);
 
 }
 
@@ -152,13 +204,15 @@ void Network::add_fc_layer(int n_input, int n_output) {
     fc_layers_number++;
 }
 
-void Network::set_communication_options(int frq, int gossip_f, int spars_f, double spars_thr) {
+void Network::set_communication_options(int frq, int gossip_f, int spars_f, double spars_thr, int group_f) {
     communication_time = 0;
     synchronization_time = 0;
+    dataload_time = 0;
     communication_frequency = frq;
     gossip_flag = gossip_f;
     sparsification_flag = spars_f;
     spars_threshold = spars_thr;
+    group_communication_flag = group_f;
 }
 
 void Network::predict( float const* const* x, int img_size_x, int img_size_y, int channels_n, float* res) {
@@ -315,22 +369,28 @@ Network::~Network() {
 }
 
 
-void Network::fit(float ***X, int *y, int img_size_x, int img_size_y, int channels_n,
-                     int sample_size, int minibatch_size, int iter_n, float learning_rate) {
+void Network::fit(std::string dataset_filename, DatasetParameters params,
+                    int minibatch_size, int iter_n, float learning_rate, int epochs_done) {
     
     int rank;
     int np;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &np);
 
+
+    dataset_params = params;
+    std::ifstream data_file(dataset_filename);
+
     l_rate = learning_rate;
-    number_of_channels = channels_n;
-    image_size_x = img_size_x;
-    image_size_y = img_size_y;
+    number_of_channels = params.channels_n;
+    image_size_x = params.img_size;
+    image_size_y = params.img_size;
     image_size = image_size_x * image_size_y;
-    int img_size = image_size;
+    int sample_size = params.train_amount;
+
 
     initial_weights_synch();
+
 
     if (minibatch_size == 0) {
         minibatch_size = sample_size;
@@ -341,19 +401,36 @@ void Network::fit(float ***X, int *y, int img_size_x, int img_size_y, int channe
     if(last_minibatch != 0) {
         minibatch_n++;
     }
+
+    int *order_of_minibatches = new int[minibatch_n];
+    for(int i = 0; i < minibatch_n; i++) {
+        order_of_minibatches[i] = i;
+    }
+
+    for(int i = 0; i < epochs_done; i++) {
+        shuffle(order_of_minibatches, minibatch_n);
+    }
+
     for(int i = 0; i < iter_n; i++) {
-        shuffle(X, y, sample_size);
+        shuffle(order_of_minibatches, minibatch_n);
+
 
         int n = minibatch_n / np + (rank < minibatch_n % np);
         int j_start = minibatch_n / np * rank + (rank < minibatch_n % np ? rank : minibatch_n % np);
         int j_finish = j_start + n;
+
         
         for(int j = j_start; j < j_finish; j++) {
-            std::cout << "\r                                                          \r";
-            std::cout << " iteration: " << i << ", minibatch: " << j << std::flush;
+
+
+            if(rank == 0) {
+                std::cout << "\r                                                          \r";
+                std::cout << " iteration: " << i << ", minibatch: " << j << std::endl;
+            }
+
             int start, finish;
-            start = j * minibatch_size;
-            finish = (j + 1) * minibatch_size;
+            start = order_of_minibatches[j] * minibatch_size;
+            finish = (order_of_minibatches[j] + 1) * minibatch_size;
             if (finish > sample_size) {
                 finish = sample_size;
             }
@@ -362,22 +439,50 @@ void Network::fit(float ***X, int *y, int img_size_x, int img_size_y, int channe
                 cur_minibatch_size = last_minibatch;
             }
 
+            double dataload_start_time, dataload_finish_time;
+            dataload_start_time = MPI_Wtime();
             float ***X_mini = new float**[cur_minibatch_size];
             int *y_mini = new int[cur_minibatch_size];
+            unsigned char temp=0;
+            int bytes_for_image = image_size * number_of_channels + 1;
             for (int k = 0; k < cur_minibatch_size; k++) {
-                X_mini[k] = X[start + k];
-                y_mini[k] = y[start + k];
+                int cur_img = start + k;
+                data_file.seekg(cur_img * bytes_for_image, std::ios::beg);
+
+                data_file.read((char*)&temp,sizeof(temp));
+                y_mini[k] = temp;
+
+                X_mini[k] = new float*[number_of_channels];
+                for(int k1 = 0; k1 < number_of_channels; k1++) {
+                    X_mini[k][k1] = new float[image_size];
+                    for(int k2 = 0; k2 < image_size; k2++) {
+                        data_file.read((char*)&temp,sizeof(temp));
+                        float value = (float)temp / params.max_pixel_value;
+                        value -= params.mean[k1];
+                        value /= params.std[k1];
+                        X_mini[k][k1][k2] = value;
+                    }
+                }
+
             }
+            dataload_finish_time = MPI_Wtime();
+            dataload_time += dataload_finish_time - dataload_start_time;
 
 
             fit_step(X_mini, y_mini, cur_minibatch_size);
 
 
+            for(int k = 0; k < cur_minibatch_size; k++) {
+                for(int k1 = 0; k1 < number_of_channels; k1++) {
+                    delete[] X_mini[k][k1];
+                }
+                delete[] X_mini[k];
+            }
             delete[] X_mini;
             delete[] y_mini;
 
             if(j != j_finish - 1 || rank >= minibatch_n % np) {
-                if( (j - j_start) % communication_frequency == 0) {
+                if( (j - j_start) % communication_frequency == 0 || group_communication_flag) {
                     double start_time, finish_time;
                     start_time = MPI_Wtime();
                     MPI_Barrier(MPI_COMM_WORLD);
@@ -385,7 +490,13 @@ void Network::fit(float ***X, int *y, int img_size_x, int img_size_y, int channe
                     synchronization_time += finish_time - start_time;
 
                     start_time = MPI_Wtime();
-                    grad_synch();
+                    if(!group_communication_flag) {
+                            grad_synch();
+                        } else if ((j - j_start) % communication_frequency == 0) {
+                            grad_synch(1);
+                        } else {
+                            grad_synch(0);
+                        }
                     finish_time = MPI_Wtime();
                     communication_time += finish_time - start_time;
                     synchronization_time += finish_time - start_time;
@@ -405,13 +516,16 @@ void Network::fit(float ***X, int *y, int img_size_x, int img_size_y, int channe
         synchronization_time += finish_time - start_time;
 
         start_time = MPI_Wtime();
-        grad_synch();
+        grad_synch(1);
         finish_time = MPI_Wtime();
         communication_time += finish_time - start_time;
         synchronization_time += finish_time - start_time;
         sgd();
         
     }
+
+    delete[] order_of_minibatches;
+    data_file.close();
 
 }
 
@@ -442,7 +556,7 @@ void Network::initial_weights_synch() {
 }
 
 
-void Network::grad_synch() {
+void Network::grad_synch(int global_iteration) {
 
     int np;
     int rank;
@@ -450,7 +564,15 @@ void Network::grad_synch() {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
 
-    if(gossip_flag == 0) {
+    if(gossip_flag == 0 || (group_communication_flag && !global_iteration)) {
+
+
+        MPI_Comm communicator = MPI_COMM_WORLD;
+        int comm_size = np;
+        if(group_communication_flag) {
+            communicator = group_communicator;
+            comm_size = group_size;
+        }
 
 
         for(int i = 0; i < conv_layers_number; i++) {
@@ -458,17 +580,17 @@ void Network::grad_synch() {
                                     conv_params[i].maps_in;
             for(int j = 0; j < conv_params[i].maps_out; j++) {
                 MPI_Allreduce(MPI_IN_PLACE, conv_weights_grad[i][j], weights_number, 
-                                MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
+                                MPI_FLOAT, MPI_SUM, communicator);
                 for(int k = 0; k < weights_number; k++) {
-                    conv_weights_grad[i][j][k] /= np;
+                    conv_weights_grad[i][j][k] /= comm_size;
                 }
             }
 
             int biases_number = conv_params[i].maps_out;
             MPI_Allreduce(MPI_IN_PLACE, conv_bias_grad[i], biases_number, 
-                            MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
+                            MPI_FLOAT, MPI_SUM, communicator);
             for(int j = 0; j < biases_number; j++) {
-                conv_bias_grad[i][j] /= np;
+                conv_bias_grad[i][j] /= comm_size;
             }
         }
 
@@ -476,16 +598,16 @@ void Network::grad_synch() {
             int weights_number = fc_params[i].n_out;
             for(int j = 0; j < fc_params[i].n_in; j++) {
                 MPI_Allreduce(MPI_IN_PLACE, fc_weights_grad[i][j], weights_number,
-                                 MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
+                                 MPI_FLOAT, MPI_SUM, communicator);
                 for(int k = 0; k < weights_number; k++) {
-                    fc_weights_grad[i][j][k] /= np;
+                    fc_weights_grad[i][j][k] /= comm_size;
                 }
             }
 
             int biases_number = fc_params[i].n_out;
-            MPI_Allreduce(MPI_IN_PLACE, fc_bias_grad[i], biases_number, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
+            MPI_Allreduce(MPI_IN_PLACE, fc_bias_grad[i], biases_number, MPI_FLOAT, MPI_SUM, communicator);
             for(int j = 0; j < biases_number; j++) {
-                fc_bias_grad[i][j] /= np;
+                fc_bias_grad[i][j] /= comm_size;
             }
         }
 
@@ -512,9 +634,9 @@ void Network::grad_synch() {
 
             for(int j = 0; j < conv_params[i].maps_out; j++) {
                 MPI_Sendrecv(conv_weights_grad[i][j], weights_number, MPI_FLOAT, neighbour_r, 0, 
-                        grad_left, weights_number, MPI_FLOAT, neighbour_l, 0, MPI_COMM_WORLD, NULL);
+                        grad_left, weights_number, MPI_FLOAT, neighbour_l, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
                 MPI_Sendrecv(conv_weights_grad[i][j], weights_number, MPI_FLOAT, neighbour_l, 0, 
-                        grad_right, weights_number, MPI_FLOAT, neighbour_r, 0, MPI_COMM_WORLD, NULL);
+                        grad_right, weights_number, MPI_FLOAT, neighbour_r, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
                 for(int k = 0; k < weights_number; k++) {
                     conv_weights_grad[i][j][k] = grad_left[k]/3 + conv_weights_grad[i][j][k]/3 + 
                                                     grad_right[k]/3;
@@ -527,9 +649,9 @@ void Network::grad_synch() {
             float *grad_bias_left = new float[biases_number];
             float *grad_bias_right = new float[biases_number];
             MPI_Sendrecv(conv_bias_grad[i], biases_number, MPI_FLOAT, neighbour_r, 0, 
-                        grad_bias_left, biases_number, MPI_FLOAT, neighbour_l, 0, MPI_COMM_WORLD, NULL);
+                        grad_bias_left, biases_number, MPI_FLOAT, neighbour_l, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             MPI_Sendrecv(conv_bias_grad[i], biases_number, MPI_FLOAT, neighbour_l, 0, 
-                        grad_bias_right, biases_number, MPI_FLOAT, neighbour_r, 0, MPI_COMM_WORLD, NULL);
+                        grad_bias_right, biases_number, MPI_FLOAT, neighbour_r, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             for(int k = 0; k < biases_number; k++) {
                 conv_bias_grad[i][k] = grad_bias_left[k]/3 + conv_bias_grad[i][k]/3 + grad_bias_right[k]/3;
             }
@@ -545,9 +667,9 @@ void Network::grad_synch() {
 
             for(int j = 0; j < fc_params[i].n_in; j++) {
                 MPI_Sendrecv(fc_weights_grad[i][j], weights_number, MPI_FLOAT, neighbour_r, 0, 
-                        grad_left, weights_number, MPI_FLOAT, neighbour_l, 0, MPI_COMM_WORLD, NULL);
+                        grad_left, weights_number, MPI_FLOAT, neighbour_l, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
                 MPI_Sendrecv(fc_weights_grad[i][j], weights_number, MPI_FLOAT, neighbour_l, 0, 
-                        grad_right, weights_number, MPI_FLOAT, neighbour_r, 0, MPI_COMM_WORLD, NULL);
+                        grad_right, weights_number, MPI_FLOAT, neighbour_r, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
                 for(int k = 0; k < weights_number; k++) {
                     fc_weights_grad[i][j][k] = grad_left[k]/3 + fc_weights_grad[i][j][k]/3 + grad_right[k]/3;
                 }
@@ -559,9 +681,9 @@ void Network::grad_synch() {
             float *grad_bias_left = new float[biases_number];
             float *grad_bias_right = new float[biases_number];
             MPI_Sendrecv(fc_bias_grad[i], biases_number, MPI_FLOAT, neighbour_r, 0, 
-                        grad_bias_left, biases_number, MPI_FLOAT, neighbour_l, 0, MPI_COMM_WORLD, NULL);
+                        grad_bias_left, biases_number, MPI_FLOAT, neighbour_l, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             MPI_Sendrecv(fc_bias_grad[i], biases_number, MPI_FLOAT, neighbour_l, 0, 
-                        grad_bias_right, biases_number, MPI_FLOAT, neighbour_r, 0, MPI_COMM_WORLD, NULL);
+                        grad_bias_right, biases_number, MPI_FLOAT, neighbour_r, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             for(int k = 0; k < biases_number; k++) {
                 fc_bias_grad[i][k] = grad_bias_left[k]/3 + fc_bias_grad[i][k]/3 + grad_bias_right[k]/3;
             }
@@ -587,58 +709,64 @@ void Network::grad_synch() {
         }
 
 
-        int total_n = 0;
-        int kek_n = 0;
-        for(int i = 0; i < conv_layers_number; i++) {
-            int weights_number = conv_params[i].kernel_size * conv_params[i].kernel_size * 
-                                    conv_params[i].maps_in;
-            for(int j = 0; j < conv_params[i].maps_out; j++) {
-                for(int k = 0; k < weights_number; k++) {
-                    if(conv_weights_grad[i][j][k] < spars_threshold && 
-                            conv_weights_grad[i][j][k] > -spars_threshold) {
+        // int total_n = 0;
+        // int kek_n = 0;
+        // for(int i = 0; i < conv_layers_number; i++) {
+        //     int weights_number = conv_params[i].kernel_size * conv_params[i].kernel_size * 
+        //                             conv_params[i].maps_in;
+        //     for(int j = 0; j < conv_params[i].maps_out; j++) {
+        //         for(int k = 0; k < weights_number; k++) {
+        //             if(conv_weights_grad[i][j][k] < spars_threshold && 
+        //                     conv_weights_grad[i][j][k] > -spars_threshold) {
 
-                        kek_n++;
-                    }
-                    total_n++;
-                }
-            }
+        //                 kek_n++;
+        //             }
+        //             total_n++;
+        //         }
+        //     }
 
-            int biases_number = conv_params[i].maps_out;
+        //     int biases_number = conv_params[i].maps_out;
 
-            for(int k = 0; k < biases_number; k++) {
-                if(conv_bias_grad[i][k] < spars_threshold && conv_bias_grad[i][k] > -spars_threshold) {
-                    kek_n++;
-                }
-                total_n++;
-            }
-        }
+        //     for(int k = 0; k < biases_number; k++) {
+        //         if(conv_bias_grad[i][k] < spars_threshold && conv_bias_grad[i][k] > -spars_threshold) {
+        //             kek_n++;
+        //         }
+        //         total_n++;
+        //     }
+        // }
 
-        for(int i = 0; i < fc_layers_number; i++) {
-            int weights_number = fc_params[i].n_out;
-            for(int j = 0; j < fc_params[i].n_in; j++) {
-                for(int k = 0; k < weights_number; k++) {
-                    if(fc_weights_grad[i][j][k] < spars_threshold && 
-                            fc_weights_grad[i][j][k] > -spars_threshold) {
+        // // std::cout << "TTTTTTTT: " << kek_n << "/" << total_n << std::endl;
+        // // kek_n = 0;
+        // // total_n = 0;
 
-                        kek_n++;
-                    }
-                    total_n++;
-                }
-            }
+        // for(int i = 0; i < fc_layers_number; i++) {
+        //     int weights_number = fc_params[i].n_out;
+        //     for(int j = 0; j < fc_params[i].n_in; j++) {
+        //         for(int k = 0; k < weights_number; k++) {
+        //             if(fc_weights_grad[i][j][k] < spars_threshold && 
+        //                     fc_weights_grad[i][j][k] > -spars_threshold) {
 
-            int biases_number = fc_params[i].n_out;
+        //                 kek_n++;
+        //             }
+        //             total_n++;
+        //         }
+        //     }
 
-            for(int k = 0; k < biases_number; k++) {
-                if(fc_bias_grad[i][k] < spars_threshold && fc_bias_grad[i][k] > -spars_threshold) {
-                    kek_n++;
-                }
-                total_n++;
-            }
-        }
+        //     int biases_number = fc_params[i].n_out;
 
-        if(rank == 0) {
-            std::cout << " " << kek_n << " / " << total_n << std::endl;
-        }
+        //     for(int k = 0; k < biases_number; k++) {
+        //         if(fc_bias_grad[i][k] < spars_threshold && fc_bias_grad[i][k] > -spars_threshold) {
+        //             kek_n++;
+        //         }
+        //         total_n++;
+        //     }
+        // }
+
+        // std::cout << "FFFFFFFF: " << kek_n << "/" << total_n << std::endl;
+
+        // if(rank == 0) {
+        //     std::cout << " " << kek_n << " / " << total_n << std::endl;
+        // }
 
 
         for(int i = 0; i < conv_layers_number; i++) {
@@ -662,9 +790,9 @@ void Network::grad_synch() {
 
             int sparse_grads_number_left, sparse_grads_number_right;
             MPI_Sendrecv(&sparse_grads_number, 1, MPI_INT, neighbour_r, 0, 
-                        &sparse_grads_number_left, 1, MPI_INT, neighbour_l, 0, MPI_COMM_WORLD, NULL);
+                        &sparse_grads_number_left, 1, MPI_INT, neighbour_l, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             MPI_Sendrecv(&sparse_grads_number, 1, MPI_INT, neighbour_l, 0, 
-                        &sparse_grads_number_right, 1, MPI_INT, neighbour_r, 0, MPI_COMM_WORLD, NULL);
+                        &sparse_grads_number_right, 1, MPI_INT, neighbour_r, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
 
             float *spars_grads_left = new float[sparse_grads_number_left];
@@ -674,17 +802,17 @@ void Network::grad_synch() {
 
             MPI_Sendrecv(spars_grads, sparse_grads_number, MPI_FLOAT, neighbour_r, 0, 
                          spars_grads_left, sparse_grads_number_left, MPI_FLOAT, neighbour_l, 0,
-                         MPI_COMM_WORLD, NULL);
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             MPI_Sendrecv(spars_grads, sparse_grads_number, MPI_FLOAT, neighbour_l, 0, 
                          spars_grads_right, sparse_grads_number_right, MPI_FLOAT, neighbour_r, 0,
-                         MPI_COMM_WORLD, NULL);
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
             MPI_Sendrecv(indices, sparse_grads_number, MPI_INT, neighbour_r, 0, 
                          indices_left, sparse_grads_number_left, MPI_INT, neighbour_l, 0, MPI_COMM_WORLD,
-                         NULL);
+                         MPI_STATUS_IGNORE);
             MPI_Sendrecv(indices, sparse_grads_number, MPI_INT, neighbour_l, 0, 
                          indices_right, sparse_grads_number_right, MPI_INT, neighbour_r, 0, MPI_COMM_WORLD,
-                         NULL);
+                         MPI_STATUS_IGNORE);
 
 
             for(int j = 0; j < conv_params[i].maps_out; j++) {
@@ -730,9 +858,9 @@ void Network::grad_synch() {
 
             int sparse_bias_grads_number_left, sparse_bias_grads_number_right;
             MPI_Sendrecv(&sparse_bias_grads_number, 1, MPI_INT, neighbour_r, 0, 
-                        &sparse_bias_grads_number_left, 1, MPI_INT, neighbour_l, 0, MPI_COMM_WORLD, NULL);
+                        &sparse_bias_grads_number_left, 1, MPI_INT, neighbour_l, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             MPI_Sendrecv(&sparse_bias_grads_number, 1, MPI_INT, neighbour_l, 0, 
-                        &sparse_bias_grads_number_right, 1, MPI_INT, neighbour_r, 0, MPI_COMM_WORLD, NULL);
+                        &sparse_bias_grads_number_right, 1, MPI_INT, neighbour_r, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
 
             float *spars_bias_grads_left = new float[sparse_bias_grads_number_left];
@@ -743,17 +871,17 @@ void Network::grad_synch() {
 
             MPI_Sendrecv(spars_bias_grads, sparse_bias_grads_number, MPI_FLOAT, neighbour_r, 0, 
                          spars_bias_grads_left, sparse_bias_grads_number_left, MPI_FLOAT, neighbour_l, 0,
-                         MPI_COMM_WORLD, NULL);
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             MPI_Sendrecv(spars_bias_grads, sparse_bias_grads_number, MPI_FLOAT, neighbour_l, 0, 
                          spars_bias_grads_right, sparse_bias_grads_number_right, MPI_FLOAT, neighbour_r, 0,
-                         MPI_COMM_WORLD, NULL);
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
             MPI_Sendrecv(indices_b, sparse_bias_grads_number, MPI_INT, neighbour_r, 0, 
                          indices_b_left, sparse_bias_grads_number_left, MPI_INT, neighbour_l, 0,
-                         MPI_COMM_WORLD, NULL);
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             MPI_Sendrecv(indices_b, sparse_bias_grads_number, MPI_INT, neighbour_l, 0, 
                          indices_b_right, sparse_bias_grads_number_right, MPI_INT, neighbour_r, 0,
-                         MPI_COMM_WORLD, NULL);
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
 
 
@@ -801,9 +929,9 @@ void Network::grad_synch() {
                 
             int sparse_grads_number_left, sparse_grads_number_right;
             MPI_Sendrecv(&sparse_grads_number, 1, MPI_INT, neighbour_r, 0, 
-                        &sparse_grads_number_left, 1, MPI_INT, neighbour_l, 0, MPI_COMM_WORLD, NULL);
+                        &sparse_grads_number_left, 1, MPI_INT, neighbour_l, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             MPI_Sendrecv(&sparse_grads_number, 1, MPI_INT, neighbour_l, 0, 
-                        &sparse_grads_number_right, 1, MPI_INT, neighbour_r, 0, MPI_COMM_WORLD, NULL);
+                        &sparse_grads_number_right, 1, MPI_INT, neighbour_r, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
             float *spars_grads_left = new float[sparse_grads_number_left];
             int *indices_left = new int[sparse_grads_number_left];
@@ -813,17 +941,17 @@ void Network::grad_synch() {
 
             MPI_Sendrecv(spars_grads, sparse_grads_number, MPI_FLOAT, neighbour_r, 0, 
                          spars_grads_left, sparse_grads_number_left, MPI_FLOAT, neighbour_l, 0,
-                         MPI_COMM_WORLD, NULL);
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             MPI_Sendrecv(spars_grads, sparse_grads_number, MPI_FLOAT, neighbour_l, 0, 
                          spars_grads_right, sparse_grads_number_right, MPI_FLOAT, neighbour_r, 0,
-                         MPI_COMM_WORLD, NULL);
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
             MPI_Sendrecv(indices, sparse_grads_number, MPI_INT, neighbour_r, 0, 
                          indices_left, sparse_grads_number_left, MPI_INT, neighbour_l, 0,
-                         MPI_COMM_WORLD, NULL);
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             MPI_Sendrecv(indices, sparse_grads_number, MPI_INT, neighbour_l, 0, 
                          indices_right, sparse_grads_number_right, MPI_INT, neighbour_r, 0,
-                         MPI_COMM_WORLD, NULL);
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
 
 
@@ -869,9 +997,9 @@ void Network::grad_synch() {
 
             int sparse_bias_grads_number_left, sparse_bias_grads_number_right;
             MPI_Sendrecv(&sparse_bias_grads_number, 1, MPI_INT, neighbour_r, 0, 
-                        &sparse_bias_grads_number_left, 1, MPI_INT, neighbour_l, 0, MPI_COMM_WORLD, NULL);
+                        &sparse_bias_grads_number_left, 1, MPI_INT, neighbour_l, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             MPI_Sendrecv(&sparse_bias_grads_number, 1, MPI_INT, neighbour_l, 0, 
-                        &sparse_bias_grads_number_right, 1, MPI_INT, neighbour_r, 0, MPI_COMM_WORLD, NULL);
+                        &sparse_bias_grads_number_right, 1, MPI_INT, neighbour_r, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
 
             float *spars_bias_grads_left = new float[sparse_bias_grads_number_left];
@@ -882,17 +1010,17 @@ void Network::grad_synch() {
 
             MPI_Sendrecv(spars_bias_grads, sparse_bias_grads_number, MPI_FLOAT, neighbour_r, 0, 
                          spars_bias_grads_left, sparse_bias_grads_number_left, MPI_FLOAT, neighbour_l, 0,
-                         MPI_COMM_WORLD, NULL);
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             MPI_Sendrecv(spars_bias_grads, sparse_bias_grads_number, MPI_FLOAT, neighbour_l, 0, 
                          spars_bias_grads_right, sparse_bias_grads_number_right, MPI_FLOAT, neighbour_r, 0,
-                         MPI_COMM_WORLD, NULL);
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
             MPI_Sendrecv(indices_b, sparse_bias_grads_number, MPI_INT, neighbour_r, 0, 
                          indices_b_left, sparse_bias_grads_number_left, MPI_INT, neighbour_l, 0,
-                         MPI_COMM_WORLD, NULL);
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             MPI_Sendrecv(indices_b, sparse_bias_grads_number, MPI_INT, neighbour_l, 0, 
                          indices_b_right, sparse_bias_grads_number_right, MPI_INT, neighbour_r, 0,
-                         MPI_COMM_WORLD, NULL);
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
 
 
@@ -1208,7 +1336,7 @@ void Network::maxpool(float const* const* x, float** res, int** indices, int fma
 
 void Network::maxpool_backward(float **x, float **res, int **indices, ConvParameters &params, int size) {
     int res_dim1 = params.maps_out;
-    int res_dim2 = size * params.img_size_x * params.img_size_y;
+    int res_dim2 = size * params.locations_n_x * params.locations_n_y;
 
     for(int i = 0; i < res_dim1; i++) {
         for(int j = 0; j < res_dim2; j++) {
@@ -1218,14 +1346,14 @@ void Network::maxpool_backward(float **x, float **res, int **indices, ConvParame
 
     for(int i = 0; i < size; i++) {
         for(int j = 0; j < params.maps_out; j++) {
-            for(int k = 0; k < params.img_size_x; k++) {
-                for(int l = 0; l < params.img_size_y; l++) {
+            for(int k = 0; k < params.locations_n_x; k++) {
+                for(int l = 0; l < params.locations_n_y; l++) {
                     int loc_k = k/2;
                     int loc_l = l/2;
-                    if(indices[j][loc_k * (params.img_size_y/2) + loc_l] == k*params.img_size_y + l) {
-                        res[j][i*params.img_size_x*params.img_size_y + k*params.img_size_y + l] =
-                             x[j][i*(params.img_size_x/2)*(params.img_size_y/2) + 
-                             loc_k*(params.img_size_y/2) + loc_l];
+                    if(indices[j][loc_k * (params.locations_n_y/2) + loc_l] == k*params.locations_n_y + l) {
+                        res[j][i*params.locations_n_x*params.locations_n_y + k*params.locations_n_y + l] =
+                             x[j][i*(params.locations_n_x/2)*(params.locations_n_y/2) + 
+                             loc_k*(params.locations_n_y/2) + loc_l];
                     }
                 }
             }
@@ -1234,15 +1362,10 @@ void Network::maxpool_backward(float **x, float **res, int **indices, ConvParame
 
 }
 
-void Network::shuffle(float*** X, int* y, int n) {
+void Network::shuffle(int* y, int n) {
     
     for(int i = 0; i < n; i++) {
         int switch_ind = rand() % n;
-        float **t;
-        t = X[i];
-        X[i] = X[switch_ind];
-        X[switch_ind] = t;
-
         int t2;
         t2 = y[i];
         y[i] = y[switch_ind];
@@ -1429,11 +1552,11 @@ void Network::fit_step(float*** X, int* y, int size) {
 
 
     int d_outputs_dim1 = conv_params[conv_layers_number - 1].maps_out;
-    int d_outputs_dim2 = size * conv_params[conv_layers_number - 1].img_size_x * 
-                            conv_params[conv_layers_number - 1].img_size_y;
+    int d_outputs_dim2 = size * conv_params[conv_layers_number - 1].locations_n_x * 
+                            conv_params[conv_layers_number - 1].locations_n_y;
     if(conv_params[conv_layers_number - 1].maxpool_flag) {
-        d_outputs_dim2 = size * (conv_params[conv_layers_number - 1].img_size_x/2) * 
-                            (conv_params[conv_layers_number - 1].img_size_y/2);
+        d_outputs_dim2 = size * (conv_params[conv_layers_number - 1].locations_n_x/2) * 
+                            (conv_params[conv_layers_number - 1].locations_n_y/2);
     }
     float **d_outputs = new float*[d_outputs_dim1];
     for(int i = 0; i < d_outputs_dim1; i++) {
@@ -1460,9 +1583,9 @@ void Network::fit_step(float*** X, int* y, int size) {
             float **d_outputs_in_wrong_form = d_outputs;
 
             d_outputs_dim1 = conv_params[i].maps_out;
-            d_outputs_dim2 = size * conv_params[i].img_size_x * conv_params[i].img_size_y;
+            d_outputs_dim2 = size * conv_params[i].locations_n_x * conv_params[i].locations_n_y;
             if(conv_params[i].maxpool_flag) {
-                d_outputs_dim2 = size * (conv_params[i].img_size_x/2) * (conv_params[i].img_size_y/2);
+                d_outputs_dim2 = size * (conv_params[i].locations_n_x/2) * (conv_params[i].locations_n_y/2);
             } 
             d_outputs = new float*[d_outputs_dim1];
             for(int j = 0; j < d_outputs_dim1; j++) {
@@ -1485,7 +1608,7 @@ void Network::fit_step(float*** X, int* y, int size) {
             float **d_outputs_small = d_outputs;
 
             d_outputs_dim1 = conv_params[i].maps_out;
-            d_outputs_dim2 = size * conv_params[i].img_size_x * conv_params[i].img_size_y;
+            d_outputs_dim2 = size * conv_params[i].locations_n_x * conv_params[i].locations_n_y;
             d_outputs = new float*[d_outputs_dim1];
             for(int j = 0; j < d_outputs_dim1; j++) {
                 d_outputs[j] = new float[d_outputs_dim2];
